@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::graph::Graph;
-use anyhow::{anyhow, Ok, Result};
+use anyhow::{anyhow, Context, Ok, Result};
 use cargo_metadata::Package;
 use petgraph::visit::EdgeRef;
 use sha1::{Digest, Sha1};
@@ -55,13 +55,25 @@ impl std::cmp::Eq for HashableSpdxItemRelationships {}
 
 /// All the data we use comes from the lock file, so we treat that
 /// as the root file of the package so we have something to checksum.
+/// The lock file lives in the workspace root, which for a workspace member
+/// is not the directory holding the member's Cargo.toml.
 fn process_root_file(
   spdx_id: &str,
-  project_directory: &Path,
-  cargo_manifest_path: &Path,
+  workspace_root: &Path,
 ) -> Result<serde_spdx::spdx::v_2_3::SpdxItemFiles> {
-  let lockfile = cargo_manifest_path.canonicalize()?.with_extension("lock");
-  let contents = std::fs::read(&lockfile)?;
+  let workspace_root = workspace_root.canonicalize().with_context(|| {
+    format!(
+      "Failed to resolve workspace root {}",
+      workspace_root.display()
+    )
+  })?;
+  let lockfile = workspace_root.join("Cargo.lock");
+  let contents = std::fs::read(&lockfile).with_context(|| {
+    format!(
+      "Failed to read lock file {} (run `cargo generate-lockfile` to create it)",
+      lockfile.display()
+    )
+  })?;
   let checksum = Sha1::digest(&contents);
 
   // SHA1 only algorithm supported
@@ -72,8 +84,8 @@ fn process_root_file(
       .build()
       .unwrap();
 
-  let relative_lockfile = PathBuf::from(&".")
-    .join(lockfile.strip_prefix(project_directory.canonicalize()?)?);
+  let relative_lockfile =
+    PathBuf::from(&".").join(lockfile.strip_prefix(&workspace_root)?);
   let relative_lockfile_string = relative_lockfile
     .to_str()
     .ok_or_else(|| anyhow!(&"Non-UTF8 relative lockfile path"))?;
@@ -100,7 +112,7 @@ fn generate_project_id(package: &Package) -> String {
 pub fn convert(
   cargo_package: Option<String>,
   project_directory: &Path,
-  cargo_manifest_path: &Path,
+  workspace_root: &Path,
   graph: &Graph,
 ) -> Result<serde_spdx::spdx::v_2_3::Spdx> {
   let creation_info =
@@ -206,35 +218,32 @@ pub fn convert(
       });
     }
 
-    root
+    for target in root
       .targets
       .iter()
       .filter(|target| target.is_bin() || target.is_lib())
-      .for_each(|target| {
-        let spdx_id = format!("SPDXRef-File-{}", target.name);
+    {
+      let spdx_id = format!("SPDXRef-File-{}", target.name);
 
-        files.push(
-          process_root_file(&spdx_id, project_directory, cargo_manifest_path)
-            .unwrap(),
-        );
-        relationships.insert(HashableSpdxItemRelationships(
-          serde_spdx::spdx::v_2_3::SpdxItemRelationshipsBuilder::default()
-            .spdx_element_id(&spdx_id)
-            .related_spdx_element(generate_project_id(root))
-            .relationship_type("GENERATED_FROM")
-            .build()
-            .unwrap(),
-        ));
+      files.push(process_root_file(&spdx_id, workspace_root)?);
+      relationships.insert(HashableSpdxItemRelationships(
+        serde_spdx::spdx::v_2_3::SpdxItemRelationshipsBuilder::default()
+          .spdx_element_id(&spdx_id)
+          .related_spdx_element(generate_project_id(root))
+          .relationship_type("GENERATED_FROM")
+          .build()
+          .unwrap(),
+      ));
 
-        relationships.insert(HashableSpdxItemRelationships(
-          serde_spdx::spdx::v_2_3::SpdxItemRelationshipsBuilder::default()
-            .spdx_element_id("SPDXRef-DOCUMENT")
-            .related_spdx_element(&spdx_id)
-            .relationship_type("DESCRIBES")
-            .build()
-            .unwrap(),
-        ));
-      });
+      relationships.insert(HashableSpdxItemRelationships(
+        serde_spdx::spdx::v_2_3::SpdxItemRelationshipsBuilder::default()
+          .spdx_element_id("SPDXRef-DOCUMENT")
+          .related_spdx_element(&spdx_id)
+          .relationship_type("DESCRIBES")
+          .build()
+          .unwrap(),
+      ));
+    }
   }
 
   let absolute_project_directory = project_directory.canonicalize()?;

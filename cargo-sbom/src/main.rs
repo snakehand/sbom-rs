@@ -319,7 +319,7 @@ fn try_main() -> Result<()> {
     let spdx = util::spdx::convert(
       opt.cargo_package,
       &opt.project_directory,
-      &cargo_manifest_path,
+      metadata.workspace_root.as_std_path(),
       &graph,
     )?;
     writeln!(
